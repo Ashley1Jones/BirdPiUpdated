@@ -12,6 +12,14 @@ import cv2
 import socket
 
 
+def info_printer(text, where=None):
+    print(f"[INFO][{where.upper() if where else '...'}]: {text}.")
+
+
+def get_dict_key(d, value):
+    return list(d.keys())[list(d.values()).index(value)]
+
+
 def append_ifabsent(fname, txt):
     if not os.path.isfile(fname):
         with open(fname, "w"):
@@ -46,7 +54,6 @@ def indent(text, num_indents):
 
 def byteHeader(header, size):
     return bytes(f"{header:<{size}}", "utf-8")
-
 
 class TimeOut:
     """
@@ -107,24 +114,32 @@ def convert2mp4(file_name):
         if not broken: os.remove(file_name)
 
 
-
-class ThreadPoolHandler(object):
-    def __init__(self):
-        self.pool = []
+class ThreadPoolHandler:
+    def __init__(self, signal_terminal=None):
+        self.pool = {}
         self.lock = Lock()
+        self.signal_terminal = signal_terminal
 
-    def add(self, t):
+    def add_to_terminal(self, text):
+        if self.signal_terminal:
+            self.signal_terminal.emit(text)
+
+    def add(self, target, args: tuple, name: str = None):
+        t = Thread(target=target, args=args)
         t.start()
+
         with self.lock:
-            self.pool.append(t)
-            self.pool = [t for t in self.pool if t.isAlive()]
-            print(f"currently {len(self.pool)} active")
+            self.pool[name if name else len(self.pool)] = t
+            self.pool = {key: t for key, t in self.pool.items() if t.isAlive()}
+            info_printer(f"currently {len(self.pool)} active", "thread handler")
         return t
 
-    def kill(self):
+    def kill_all(self):
         with self.lock:
             print(f"Killing remaining {len(self.pool)} threads in pool")
-            [kill_thread(t) for t in self.pool]
+            [kill_thread(t) for t in self.pool.values()]
+        del self.pool
+        self.pool = {}
 
 
 def SubProcessClass(target, finish, args, method="thread"):

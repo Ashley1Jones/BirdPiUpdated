@@ -7,6 +7,7 @@ import io
 import struct
 from PIL import Image
 import numpy as np
+import zlib
 
 
 def create_server(port, n=10):
@@ -16,156 +17,169 @@ def create_server(port, n=10):
     s.listen(n)
     return s
 
-#Highmac1953
-class CreateServerClass(object):
-    def __init__(self, port, signal_terminal=None, signal_new_cam=None, n=5):
-        self.signal_terminal = signal_terminal
-        self.port = port
-        self.finish = Event()
-        self.lock = Lock()
-        self.headersize = 40
-        self.signal_new_cam = signal_new_cam
+
+def create_client(ip, port, timeout=None):
+    start = time.time()
+    while True:
+        if timeout:
+            if time.time() - start > timeout:
+                return None
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            self.s = create_server(self.port, n)
-        except:
-            if signal_new_cam:
-                self._add_to_terminal("ERROR: Not network connection")
-                return
-        self.s.settimeout(10)
-        self.coms = {}
-        self.accept_thread = Thread(target=self._accept_coms)
-        self.accept_thread.start()
+            s.connect((ip, port))
+            break
+        except ConnectionRefusedError:
+            s.close()
+            time.sleep(1)
+            continue
+        except socket.timeout:
+            s.close()
+            raise socket.error
+    return s
 
-    def _accept_coms(self):
-        """
-        this functions launches the server socket
-        each time client connects to the server, it is stored in a dictionary with the name sent from the client
-        """
-        while not self.finish.is_set():
-            try:
-                print(f"accepting on port {self.port}")
-                clientsocket, address = self.s.accept()
-            except:
-                time.sleep(1 / 10)
-                continue
-            print(f"--connection from address {address} has been established--")
-            address = address[0]
-            with self.lock:
-                if address in self.coms:
-                    self.coms[address].close()
-                    print("--already got that camera--")
-                clientsocket.settimeout(10)
-                self.coms[address] = clientsocket
-                self._emit(f"{address}-Waiting-a")
 
-    def before_send_checks(self, ip):
-        if len(self.coms) == 0:
-            self._add_to_terminal("No camera(s) connected")
-            return False
-        elif ip not in self.coms:
-            self._add_to_terminal(f"{ip} not in list of connections")
-            return False
-        else:
-            return True
+def format_msg(msg):
+    code = '/#/'
+    if type(msg) is str:
+        msg += f"{code}none{code}END{code}"
+    elif type(msg) is list:
+        new_msg = ""
+        msg.append("END")
+        for m in msg:
+            new_msg += f"{m}{code}"
+        msg = new_msg
+    else:
+        raise TypeError
+    return msg
+
+
+class SocketOptionsMethods(object):
+    def __init__(self, signal_terminal=None, signal_update=None):
+        self.signal_terminal = signal_terminal
+        self.signal_update = signal_update
+        self.headersize = 40
+        self.split = '/#/'
+        self.main_port = 9000
+        self.downlaod_port = self.main_port + 1
+        self.stream_port = self.main_port + 2
+        self.closed = Event()
+
+    def close(self):
+        self.closed.set()
 
     def _add_to_terminal(self, text):
         if self.signal_terminal:
             self.signal_terminal.emit(text)
 
-    def _format_message(self, msg):
-        if type(msg) is str:
-            msg += "-none-"
-        elif type(msg) is list:
-            new_msg = ""
-            for m in msg:
-                new_msg += f"{m}-"
-            msg = new_msg
-        else:
-            self._add_to_terminal(f"{msg} not appropriate message type")
-            return "None"
-        return msg
+    def _update_cam(self, text):
+        if self.signal_update:
+            self.signal_update.emit(text)
 
-    def _remove_ip(self, ip):
-        self.coms[ip].close()
-        self.coms.pop(ip)
 
-    def _emit(self, msg):
-        if self.signal_new_cam:
-            self.signal_new_cam.emit(msg)
+class CommandWorker(Thread, SocketOptionsMethods):
+    def __init__(self, ip, connection, signal_terminal, signal_new_cam, signal_wifi):
+        Thread.__init__(self)
+        SocketOptionsMethods.__init__(self, signal_terminal, signal_new_cam)
+        self.signal_wifi = signal_wifi
+        self.ip = ip
+        self.connection = connection
+        self.closed = Event()
+        self.queue = Queue()
+        self.check_hz = 1
+        self.start()
+
+    def put(self, msg):
+        self.queue.put(msg)
 
     def close(self):
-        self.finish.set()
-        self.s.close()
+        self.closed.set()
+        try:
+            while not self.queue.empty():
+                self.queue.get(timeout=1)
+            self.queue.close()
+        except BrokenPipeError:
+            pass
+        except:
+            traceback.print_exc()
 
-
-class CommandServer(CreateServerClass):
-    def __init__(self, port, signal_terminal, signal_new_cam):
-        super().__init__(port,
-                         signal_terminal=signal_terminal,
-                         signal_new_cam=signal_new_cam)
-        self.queue = Queue()
-        self.command_thread = Thread(target=self._command_sender)
-        self.command_thread.start()
-
-    def _command_sender(self):
-        """
-        check if there are commands to be sent
-        if not, check if 5 seconds have passed since last cameras coms have been checked
-        if so, send message and recv with timeout
-        if no reponse, close client and pop from dictionary
-        :return:
-        """
+    def run(self):
         last_checked = time.time()
-        while not self.finish.is_set():
+        while not self.closed.is_set():
             if not self.queue.empty():
                 msg = self.queue.get()
                 print("sent to queue ", msg)
                 ip, msg = msg
-                self._send(ip, msg)
-            elif time.time() - last_checked > 1:
-                self._check_on_all()
+                self._send(msg)
+            elif time.time() - last_checked > 1 / self.check_hz:
+                self._send(format_msg(['check', 'none']))
                 last_checked = time.time()
             else:
                 time.sleep(1 / 100)
 
-    def put(self, ip, msg):
-        msg = self._format_message(msg)
-        self.queue.put((ip, msg))
-
-    def sendall(self, msg):
-        msg = self._format_message(msg)
-        for ip in self.coms.keys():
-            self.queue.put((ip, msg))
-
-    def _check_on_all(self):
+    def _send(self, msg):
         try:
-            for ip, com in self.coms.items():
-                self._send(ip, "check-none-")
+            msg = byteHeader(msg, self.headersize)
+            self.connection.send(msg)
+            time.sleep(1 / 100)
+            msg = self.connection.recv(self.headersize).decode()
+            # if the message is a standard short reply, just remove spaces
+            if msg[-1] == " ":
+                msg = msg.replace(' ', '')
+                self.signal_update.emit(format_msg(['e', self.ip, msg]))
+            else:
+                # otherwise, buffer until the end of message is found
+                while True:
+                    msg += self.connection.recv(self.headersize).decode()
+                    if "END" in msg:
+                        msg.replace(' ', '')
+                        break
+                self.signal_wifi.emit(format_msg([self.ip, msg]))
+        except socket.timeout:
+            # traceback.print_exc()
+            print(f"{self.ip} didn't reply in time... closing")
+            self._update_cam(format_msg(['d', self.ip, 'Disconnected']))
+            self.close()
         except:
             traceback.print_exc()
-
-    def _send(self, ip, msg):
-        with self.lock:
-            try:
-                if ip in self.coms:
-                    print(f"{msg} before bye header")
-                    msg = byteHeader(msg, self.headersize)
-                    print(f"sending {msg}")
-                    self.coms[ip].send(msg)
-                    time.sleep(1 / 100)
-                    msg = self.coms[ip].recv(self.headersize).decode().replace(' ', '')
-                    self._emit(f"{ip}-{msg}-e")
-                else:
-                    print(f"{ip} not in coms of port {self.port}")
-            except:
-                print(f"{ip} didn't reply in time... closing")
-                self.signal_new_cam.emit(f"{ip}-Disconnected-d")
-                self._remove_ip(ip)
+            print(f"{self.ip} had an error in communication... closing")
+            self._update_cam(format_msg(['d', self.ip, 'Disconnected']))
+            self.close()
 
 
-class LiveStreamServer(CreateServerClass):
-    def __init__(self, port, signal_terminal):
-        super().__init__(port, signal_terminal=signal_terminal)
+class CommandServer(SocketOptionsMethods):
+    def __init__(self, signal_terminal, signal_update, signal_wifi):
+        super().__init__(signal_terminal, signal_update)
+        self.connections = {}
+        self.signal_wifi = signal_wifi
+        self.timeout = 10
+
+    def add_ip(self, ip, rpi):
+        rpi.settimeout(self.timeout)
+        self.connections[ip] = CommandWorker(ip, rpi,
+                                             self.signal_wifi,
+                                             self.signal_update,
+                                             self.signal_wifi)
+
+        self._update_cam(format_msg(['a', ip, 'Waiting']))
+
+    def put(self, ip, msg):
+        msg = format_msg(msg)
+        self.connections[ip].put((ip, msg))
+
+    def sendall(self, msg):
+        msg = format_msg(msg)
+        for ip, connection in self.connections.items():
+            connection.put((ip, msg))
+
+    def close(self):
+        for connection in self.connections.values():
+            if not connection.closed.is_set():
+                connection.close()
+
+
+class LiveStreamServer(SocketOptionsMethods):
+    def __init__(self, signal_terminal):
+        super().__init__(signal_terminal=signal_terminal)
         self.stream_yn = Event()
 
     def start_stream(self, ip, pixmap):
@@ -176,18 +190,10 @@ class LiveStreamServer(CreateServerClass):
         self.stream_yn.set()
 
     def _start_stream(self, ip, pixmap):
-        self._add_to_terminal("INFO: Starting live stream")
-        started = time.time()
-        while not ip in self.coms:
-            time.sleep(1/10)
-            if time.time()-started > 5:
-                print("Stream timed out")
-                return
-        skt = self.coms[ip]
+        self._add_to_terminal("Starting live stream")
+        skt = create_client(ip, self.stream_port)
         skt.settimeout(10)
         connection = skt.makefile("rb")
-        skipped = 0
-        # stream = io.BytesIO()
         width, height = pixmap.geometry().height(), pixmap.geometry().width()
         try:
             while True:
@@ -195,13 +201,14 @@ class LiveStreamServer(CreateServerClass):
                 if image_len == 0 and self.stream_yn.is_set():
                     break
                 stream = io.BytesIO()
-                stream.write(connection.read(image_len))
+                data = connection.read(image_len)
+                stream.write(data)
                 stream.seek(0)
-                # img_bytes = connection.read(image_len)
-                #image = Image.open(img_bytes)
                 try:
                     image = Image.open(stream).convert("RGB")
                 except:
+                    traceback.print_exc()
+                    skt.send(b"OK")
                     continue
                 image.verify()
                 image = np.array(image)#, dtype=np.uint8)
@@ -210,22 +217,26 @@ class LiveStreamServer(CreateServerClass):
                 qim = QtGui.QImage(image.data, image.shape[1], image.shape[0], image.strides[0],
                                    QtGui.QImage.Format_RGB888)#.rgbSwapped()
                 pixmap.setPixmap(QtGui.QPixmap(qim))
+                #print("SNEDING?")
+                skt.send(b"OK")
+        except socket.timeout:
+            traceback.print_exc()
         finally:
             connection.close()
             skt.close()
-            self.coms.pop(ip)
             self.stream_yn.clear()
             image = np.zeros((height, width), dtype=np.uint8)
             qim = QtGui.QImage(image.data, image.shape[1], image.shape[0], image.strides[0],
                                QtGui.QImage.Format_RGB888).rgbSwapped()
             pixmap.setPixmap(QtGui.QPixmap(qim))
+            self._add_to_terminal("Ending live stream")
 
 
-class DownloadServer(CreateServerClass):
-    def __init__(self, port, signal_download, signal_terminal):
-        super().__init__(port, signal_terminal=signal_terminal)
+class DownloadServer(SocketOptionsMethods):
+    def __init__(self, dir, signal_download=None, signal_terminal=None):
+        super().__init__(signal_terminal=signal_terminal)
         self.signal_download = signal_download
-        self.video_dir = create_and_return_file("videos")
+        self.video_dir = create_and_return_file(dir)
         self.buffer = 8 * 1024
         # keep track of how much downloaded
         self.downloaded = 0
@@ -233,48 +244,54 @@ class DownloadServer(CreateServerClass):
         self.t_handler = {}
 
     def _update_progress(self, text):
-        self.signal_download.emit(text)
+        if self.signal_download:
+            self.signal_download.emit(text)
 
     def get_files(self, ip):
-        if self.before_send_checks(ip):
-            if ip in self.t_handler:
-                if not self.t_handler[ip].is_alive():
-                    self.t_handler[ip] = Thread(target=self._get_files, args=(ip,))
-                    self.t_handler[ip].start()
-                else:
-                    self._add_to_terminal(f"{ip} already downloading")
-            else:
+        if ip in self.t_handler:
+            if not self.t_handler[ip].is_alive():
                 self.t_handler[ip] = Thread(target=self._get_files, args=(ip,))
                 self.t_handler[ip].start()
+            else:
+                self._add_to_terminal(f"{ip} already downloading")
+        else:
+            self.t_handler[ip] = Thread(target=self._get_files, args=(ip,))
+            self.t_handler[ip].start()
 
     def _get_files(self, ip):
-        """
-        This function needs to be threaded.  Retrieves file size and name in header.
-        Then loop to receive the whole file
-        :param skt: individual client socket
-        :param buffer: byte size of each buffer
-        :return:
-        """
-        skt = self.coms[ip]
-        print("start downloading")
+        info_printer("Connecting to files server", "Get Files")
+        skt = create_client(ip, self.downlaod_port, 10)
+        if skt is None:
+            info_printer("Failed Connect", "Get Files")
+            return
+        info_printer("Connected", "Get Files")
+        # get info on downloads
         info = skt.recv(self.headersize).decode().split("-")
         n_files, self.downloading = int(info[0]), float(info[1])
         if n_files == 0:
             self._add_to_terminal("No files to retrieve")
-            # clear close from pipeline that otherwise be taken later
-            skt.recv(self.headersize)
             self._update_progress(f"{ip}-N/a-N/a")
+            skt.close()
             return
         self._add_to_terminal(f"Downloading {n_files} with size {int(self.downloading / 1e6)}Mb")
         self._update_progress(f"{ip}-0-...")
         time.sleep(1)
+        self.downloaded = 0
+        self._get_videos(skt, ip)
+        self._finish(skt, ip)
+
+    def _finish(self, skt, ip):
+        print("finished downloading")
+        self._update_progress(f"{ip}-Done-N/a")
+        skt.close()
+
+    def _get_videos(self, skt, ip):
         # first loop to collect all files
-        while not self.finish.is_set():
-            msg_string = b""
+        while not self.closed.is_set():
             msg = skt.recv(self.headersize)
             # if message is close, then close socket
-            if msg[:5] == b"CLOSE":
-                print("--end of messages--")
+            if b"ENDALL" in msg or b"CLOSE" in msg:
+                info_printer("End of videos", "Get Videos")
                 break
             # gather message bytes length and name of file
             msg = msg.decode().split("-")
@@ -284,17 +301,15 @@ class DownloadServer(CreateServerClass):
             self._buffer_recv(skt, msg_name, msg_len, ip)
             self._update_progress(f"{ip}-{math.ceil(100 * self.downloaded / self.downloading)}-Blah")
             print(f"    {msg_name} saved")
-        print("finished downloading")
-        self._update_progress(f"{ip}-Done-N/a")
-        self.downloaded = 0
 
     def _buffer_recv(self, skt, msg_name, msg_len, ip):
         fname = f"{self.video_dir}/{msg_name}"
         recv_msg_len = 0
         n_buffers = 0
         print_time = time.time()
+        start = time.time()
         with open(fname, "ab") as v:
-            while not self.finish.is_set():
+            while not self.closed.is_set():
                 msg = skt.recv(self.buffer)
                 recv_msg_len += len(msg)
                 self.downloaded += len(msg)
@@ -314,3 +329,62 @@ class DownloadServer(CreateServerClass):
                     # eta = round((downloading - downloaded) / speed, 2)
                     self._update_progress(f"{ip}-{math.ceil(100 * self.downloaded / self.downloading)}-BLAH")
                     n_buffers = 0
+        info_printer(f"That took {time.time() - start}", "download performance")
+
+
+class ignore4now(object):
+    def _f_bytes(self, b):
+        return b.decode().replace(" ", "")
+
+    def _get_lapses(self, skt, ip):
+        connection = skt.makefile("rb")
+        out = None
+
+        try:
+            while not self.closed.is_set():
+                name = connection.read(self.headersize)
+                print(f"Downloading name {name}")
+                name = self._f_bytes(name)
+                if "ENDALL" in name:
+                    info_printer("End of Lapses", "Get Lapses")
+                    break
+                name, fps = name.split("-")
+                fps = int(fps)
+
+                out = None
+
+                while not self.closed.is_set():
+                    size = connection.read(self.headersize)
+                    print(f"Downloading image of size {size}")
+                    size = self._f_bytes(size)
+                    if "END" in size:
+                        break
+                    size = int(size)
+                    self.downloaded += size
+                    self._update_progress(f"{ip}-{math.ceil(100 * self.downloaded / self.downloading)}-BLAH")
+                    img = connection.read(size)
+                    img = self._jpg2RGB(img)
+                    if out:
+                        pass
+                    else:
+                        out = cv2.VideoWriter(os.path.join(self.video_dir, f"{name}.mp4"),
+                                              cv2.VideoWriter_fourcc("m", "p", "4", "v"), fps,
+                                              (img.shape[1], img.shape[0]))
+                    out.write(img)
+                out.release()
+                skt.send(b"OK")
+        finally:
+            connection.close()
+            if out: out.release()
+
+    def _jpg2RGB(self, img):
+        stream = io.BytesIO()
+        stream.write(img)
+        stream.seek(0)
+        image = Image.open(stream).convert("RGB")
+        image.verify()
+        return np.array(image)
+
+
+
+

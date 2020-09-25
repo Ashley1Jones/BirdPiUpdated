@@ -10,24 +10,45 @@
 from PyQt5.QtWidgets import QFileSystemModel
 from PyQt5 import QtCore
 import vlc
-import os.path
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QInputDialog, QLineEdit
 from Communications import *
-from Mainui import Ui_MainWindow as UI
+from UIs.Mainui import Ui_MainWindow as UI
 import cv2
+from UI_Utils import *
+from traceback import print_exc
+import os
+#from PyQt5 import uic
+#path = os.path.dirname(__file__)
+#qfile_wifi = "wifi_ui.ui"
+#Wifi_Dialog, _ = uic.loadUiType(os.path.join(path, qfile_wifi))
 
 
 class Ui_MainWindow(QObject, UI):
     signal_terminal = QtCore.pyqtSignal(str)
     signal_dowload = QtCore.pyqtSignal(str)
     signal_update_cam = QtCore.pyqtSignal(str)
+    signal_wifi = QtCore.pyqtSignal(str)
 
     def extra(self, MainWindow):
+        # get current working directory
+        if getattr(sys, 'frozen', False):
+            info_printer("Programme is exe. Using sys.executable to find dir", "Main")
+            self.dir_path = os.path.dirname(sys.executable)
+        else:
+            info_printer("Programme is not exe", "Main")
+            self.dir_path = os.path.dirname(os.path.realpath(__file__))
+
+        # create directories names
+        self.vid_dir = os.path.join(self.dir_path, 'videos')
+        self.settings_dir = os.path.join(self.dir_path, 'settings')
+        # make folders if there are not any
+        [os.mkdir(d) for d in (self.vid_dir, self.settings_dir) if not os.path.isdir(d)]
+
         # save main window widget
         self.MainWindow = MainWindow
         # create screenshots directory
-        self.screenshot_dir = "screenshots"
+        self.screenshot_dir = os.path.join(self.dir_path, 'screenshots')
         if not os.path.isdir(self.screenshot_dir): os.mkdir(self.screenshot_dir)
 
         # terminal printing activity
@@ -43,118 +64,136 @@ class Ui_MainWindow(QObject, UI):
         self.button_dowload_files.clicked.connect(self.downlaod_files)
         self.signal_dowload.connect(self.upload_download_table)
 
+        # connnect wifi updater
+        self.signal_wifi.connect(self.update_wifi)
+
         # create backend sockets and give them signals
         signals = {"dl_progress": self.signal_dowload,
                    "terminal": self.signal_terminal,
-                   "new_cam": self.signal_update_cam}
-        self.coms = Communications(signals)
+                   "new_cam": self.signal_update_cam,
+                   "wifi": self.signal_wifi}
+        self.coms = Communications(signals, self.vid_dir, self.dir_path)
 
         # create folders viewer
         self.add_folder_tree()
-        self.add_vlc() # create video player
+        self.add_vlc()  # create video player
         self.button_screenshot.clicked.connect(self.take_screenshot)
 
         self.live_on_off = {"STOP": "Stop Live Stream", "START": "Start Live Stream"}
         self.button_live_stream.clicked.connect(self.change_live)
 
-        # create settings now
-        #self.button_apply_settings.clicked.connect(self.send_cam_settings)
-        #self.button_auto_settings.clicked.connect(lambda: self.reset_cam_settings(None))
-        # see if there are any settings files for the camera
-        if os.path.isfile("settings.txt"):
-            with open("settings.txt", "r") as settings:
-                s = [int(i) for i in settings.readlines()]
-        else:
-            s = None
-        self.reset_cam_settings(s)
-
         # make a class which handles all the messy threads
-        self.thread_handler = ThreadPoolHandler()
+        self.thread_handler = ThreadPoolHandler(self.signal_terminal)
         # create a list of buttons to be disabled when downloading is in progress
         self.button_list = [self.button_apply_settings, self.button_live_stream, self.button_auto_settings]
 
+        #self.pushButton_scan.clicked.connect(self.seek_avail_ips)
+        self.pushButton_scan.clicked.connect(self.coms.seek_available_ips)
+        # splitting up strings into individual messages
+        self.split = '/#/'
+        self.split2 = '/;/'
+        # to manage camera names and ip adresses
+        self.CamManager = CameraManager(self.MainWindow,
+                                            self.combo_select_camera,
+                                            self.table_cam,
+                                            self.settings_dir)
+
+    #def seek_avail_ips(self):
+        #setting = SearchDialog().getResults()
+        #if setting is None:
+        #    return
+        #ext = setting == "ext"
+        #self.coms.seek_available_ips(ext)
+
     def send_task(self):
-        ip = self.combo_select_camera.currentText()
+        ip = self.CamManager.current_ip()
         if self.coms.before_send_checks(ip):
             task = self.combo_set_task.currentText()
-            if task == "Night Watch" or task == "Timelapse":
-                print("Do not have feature")
+            task = task.lower().replace(" ", "_")
+
+            if task == "night_watch":
                 self.signal_terminal.emit("Feature not implemented...")
                 return
-            task = task.lower().replace(" ", "_")#+"-none-"
-            if task == "add_wifi":
-                self.add_wifi(ip)
+
+            elif task == "timelapse":
+                ret, results = TimeLapseDialog().results
+                while ret == 2:
+                    ret, results = TimeLapseDialog("Enter Times At least 30 Minutes Apart").results
+                if results is not None:
+                    options = [task] + list(results)
+                    self.coms.command_server.put(ip, options)
+                return
+
+            elif task == "add_wifi":
+                self.coms.command_server.put(ip, "send_wifi_config")
                 return
 
             self.coms.command_server.put(ip, task)
-            self.signal_terminal.emit(f"Sending task {task} to {ip}")
 
-    def add_wifi(self, ip):
-        name = "Network Name:"
-        pswd = "Network Password:"
-        text, ok = QInputDialog.getMultiLineText(self.MainWindow, "Add wifi",
-                                                 "Name and password", f"{name}\n{pswd}")
-        if ok:
-            text = text.split("\n")
-            name = text[0].replace(name, "")
-            pswd = text[1].replace(pswd, "")
-            print(f"Name: {name}, Pswed: {pswd}--")
-            self.signal_terminal.emit(f"Wifi added with name {name}")
-            self.coms.command_server.put(ip, ["add_wifi", name, pswd])
-
-    def downlaod_files(self):
+    @QtCore.pyqtSlot(str)
+    def update_wifi(self, msg):
+        print("ALL The way over here", msg)
         try:
-            ip = self.combo_select_camera.currentText()
-            if self.coms.before_send_checks(ip):
-                self.coms.command_server.put(self.combo_select_camera.currentText(), "send_files")
-                self.coms.download_server.get_files(ip)
+            msg = msg.split(self.split)
+            ip = msg.pop(0)
+            msg = [np.split(self.split2) for np in msg if len(np.split(self.split2)) == 2]
+            print("formateed", msg)
+            results = WifiDialog(msg).results
+            if results is None:
+                return
+            command = "add_wifi_config"
+            results.insert(0, command)
+            print("New config", results)
+            self.coms.command_server.put(ip, results)
         except:
             traceback.print_exc()
+
+    def downlaod_files(self):
+        ip = self.CamManager.current_ip()
+        if self.coms.before_send_checks(ip):
+            self.coms.command_server.put(ip, "send_files")
+            self.coms.download_server.get_files(ip)
 
     @QtCore.pyqtSlot(str)
     def upload_download_table(self, msg):
         print("download just got : ", msg)
         split = msg.split("-")
         ip, perc, eta = split
-        idx, rows = self.get_table_index(ip)
-        self.table_cam.setItem(idx, 5, QtWidgets.QTableWidgetItem(perc))
-        # self.table_cam.setItem(idx, 6, QtWidgets.QTableWidgetItem(eta)) removed
-
-    def get_table_index(self, ip):
-        rows = self.table_cam.rowCount()
-        column_text = [self.table_cam.item(row, 1).text() if self.table_cam.item(row, 1) else None
-                       for row in range(rows)]
-        return column_text.index(None) if ip not in column_text else column_text.index(ip), rows
+        self.CamManager.update_download(ip, perc)
+        if not perc.isnumeric():
+            msg = QtWidgets.QMessageBox()
+            msg.setWindowTitle("INFO")
+            msg.setText(f"'{self.CamManager.cam_name(ip)}' Download Complete")
+            msg.setIcon(QtWidgets.QMessageBox.Information)
+            msg.exec_()
 
     @QtCore.pyqtSlot(str)
     def update_cam_selection(self, msg):
-        print(f"emitted {msg}")
+        try:
+            self._update_cam_selection(msg)
+        except:
+            print_exc()
+
+    def _update_cam_selection(self, msg):
+        # print(f"emitted {msg}")
         if "--" in msg:
             print("broken")
             return
-        split = msg.split("-")
-        ip, task, dun = split[0], split[1], split[-1]
-        idx, rows = self.get_table_index(ip)
-        if dun == "a":
-            # add ip
-            self.combo_select_camera.addItem(ip)
-            # if ip not in column add ip and add column
-            self.table_cam.setItem(idx, 1, QtWidgets.QTableWidgetItem(ip))
-            self.table_cam.setItem(idx, 2, QtWidgets.QTableWidgetItem(task))
-            self.signal_terminal.emit(f"{ip} added to available cameras")
-        elif dun == "d":
-            index = self.combo_select_camera.findText(ip)
-            self.combo_select_camera.removeItem(index)
-            self.table_cam.setItem(idx, 2, QtWidgets.QTableWidgetItem(task))
-            self.signal_terminal.emit(f"{ip} removed from available cameras")
-        elif dun == "e":
-            n_files, total_size = split[2], split[3]
-            self.table_cam.setItem(idx, 3, QtWidgets.QTableWidgetItem(n_files))
-            self.table_cam.setItem(idx, 4, QtWidgets.QTableWidgetItem(total_size))
-        self.table_cam.setItem(idx, 2, QtWidgets.QTableWidgetItem(task))
-        print("testing index and rows", idx, rows)
-        if idx + 1 == rows:
-            self.table_cam.setRowCount(rows + 1)
+        split = msg.split("/#/")
+        key = split.pop(0)
+        ip = split.pop(0)
+        name = self.CamManager.cam_name(ip)
+        if key == "a":
+            self.CamManager.add_cam(ip)
+            self.signal_terminal.emit(f"'{name}' added to available cameras")
+        elif key == "d":
+            self.CamManager.delete_cam(ip)
+            self.signal_terminal.emit(f"'{name}' removed from available cameras")
+        elif key == "e":
+            self.CamManager.edit_table(ip, *split[:3])
+        elif key == "wifi":
+            print("Adding this to wifi", split)
+            self.wifi_config.put(split)
 
     def reset_cam_settings(self, settings=None):
         if settings is None:
@@ -167,31 +206,27 @@ class Ui_MainWindow(QObject, UI):
             self.slider_leftright.setSliderPosition(settings[2])
             self.slider_zoom.setSliderPosition(settings[1])
             self.slider_exposure.setSliderPosition(settings[0])
-        ip = self.combo_select_camera.currentText()
+        ip = self.CamManager.current_ip()
         if self.coms.before_send_checks(ip):
             self.send_cam_settings()
 
     def send_cam_settings(self):
         sliders = (self.slider_exposure.sliderPosition(),
-        self.slider_zoom.sliderPosition(),
-        self.slider_leftright.sliderPosition(),
-        self.slider_updown.sliderPosition())
+                   self.slider_zoom.sliderPosition(),
+                   self.slider_leftright.sliderPosition(),
+                   self.slider_updown.sliderPosition())
         # first save changes in text file
         with open("settings.txt", "w+") as s:
             for slider in sliders:
                 s.write(f"{slider}\n")
         self.coms.change_cam_settings(*sliders)
 
-    @QtCore.pyqtSlot(int)
-    def update_download_progress(self, prog):
-        pass
-
     @QtCore.pyqtSlot(str)
     def add_to_terminal(self, text):
         self.terminal.append(text)
 
     def change_live(self):
-        ip = self.combo_select_camera.currentText()
+        ip = self.CamManager.current_ip()
         if self.coms.before_send_checks(ip):
             if self.button_live_stream.text() == self.live_on_off["START"]:
                 self.button_live_stream.setText(self.live_on_off["STOP"])
@@ -265,7 +300,6 @@ class Ui_MainWindow(QObject, UI):
     def playpause(self):
         """Toggle play/pause status
         """
-        print("HERE", self.mediaplayer.is_playing())
         if self.mediaplayer.is_playing():
             self.mediaplayer.pause()
             self.button_play_pause.setText("Play")
@@ -275,7 +309,7 @@ class Ui_MainWindow(QObject, UI):
                 print("no video selected")
                 # self.OpenFile()
                 return
-            self.mediaplayer\
+            self.mediaplayer \
                 .play()
             self.button_play_pause.setText("Pause")
             self.timer.start()
@@ -288,7 +322,8 @@ class Ui_MainWindow(QObject, UI):
 
     def cleanup(self):
         self.coms.cleanup()
-        self.thread_handler.kill()
+        self.CamManager.save()
+        self.thread_handler.kill_all()
 
     def add_folder_tree(self):
         self.load_project_structure(self.file_viewer)
@@ -301,10 +336,10 @@ class Ui_MainWindow(QObject, UI):
         font.setPointSize(8)
         tree.setFont(font)
         self.menu_model = QFileSystemModel()
-        self.menu_model.setRootPath(os.getcwd())
+        self.menu_model.setRootPath(self.dir_path)
         # model.setRootPath(QDir)
         tree.setModel(self.menu_model)
-        tree.setRootIndex(self.menu_model.index(os.getcwd()))
+        tree.setRootIndex(self.menu_model.index(self.dir_path))
 
     def context_menu(self):
         menu = QtWidgets.QMenu()
@@ -322,23 +357,24 @@ class Ui_MainWindow(QObject, UI):
         menu.exec_(cursor.pos())
 
     def convert2mp4(self):
-        conversion = self.thread_handler.add(Thread(target=self._convert2mp4))
+        self.thread_handler.add(self._convert2mp4, ())
 
     def _convert2mp4(self):
         file_name = self.get_file_from_menu()
-        self.add_to_terminal(f"Converting {file_name}")
+        self.add_to_terminal(f"Converting {file_name}"
+                             )
         self.check_if_playing(file_name)
         convert2mp4(file_name)
         self.add_to_terminal(f"Finished converting {file_name}")
 
     def dowscale_mp4(self):
-        width, ok = QInputDialog.getText(self.MainWindow, "Get Text", "Width of video to downscale: ", QLineEdit.Normal, "")
+        width, ok = QInputDialog.getText(self.MainWindow, "Get Text", "Width of video to downscale: ", QLineEdit.Normal,
+                                         "")
         if ok and width != "":
             if not (width.isnumeric() and int(width) < 1280):
                 self.add_to_terminal("Enter a valid number")
                 return
-            downscaling = self.thread_handler.add(Thread(target=self._downscale_mp4,
-                                                         args=(width,)))
+            self.thread_handler.add(target=self._downscale_mp4, args=(width,))
 
     def _downscale_mp4(self, width):
         file_name = self.get_file_from_menu()
@@ -351,9 +387,9 @@ class Ui_MainWindow(QObject, UI):
         fourcc = cv2.VideoWriter_fourcc("M", "P", "4", "V")
         ret, img = cap.read()
         width = int(width)
-        height = int((9/16)*width)
+        height = int((9 / 16) * width)
         img = cv2.resize(img, (width, height))
-        new_name = file_name.split(".")[0]+"_downscaled"+".mp4"
+        new_name = file_name.split(".")[0] + "_downscaled" + ".mp4"
         out = cv2.VideoWriter(new_name, fourcc, 24, (img.shape[1], img.shape[0]))
         while True:
             out.write(img)
@@ -383,7 +419,7 @@ class Ui_MainWindow(QObject, UI):
 
     def open_file(self):
         file_name = self.get_file_from_menu()
-        if file_name.split(".")[-1] in ["h264", "mp4"]:
+        if file_name.split(".")[-1] in ["h264", "mp4", "avi", "mov"]:
             self.open_video(file_name)
         else:
             os.startfile(file_name)
@@ -407,6 +443,7 @@ class Ui_MainWindow(QObject, UI):
 
 if __name__ == "__main__":
     import sys
+
     app = QtWidgets.QApplication(sys.argv)
     MainWindow = QtWidgets.QMainWindow()
     ui = Ui_MainWindow()
@@ -418,4 +455,3 @@ if __name__ == "__main__":
     print("coms cleaned up")
     # sys.exit(app.exec_())
     sys.exit()
-
